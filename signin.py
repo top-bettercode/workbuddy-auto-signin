@@ -45,6 +45,11 @@ from datetime import datetime
 
 DEFAULT_ENDPOINT = "https://copilot.tencent.com"
 AUTH_BASENAME = os.path.join("CodeBuddyExtension", "Data", "Public", "auth", "workbuddy-desktop.info")
+# Linux 没有桌面端，入口是 CodeBuddy CLI；它写出的凭据文件名不同、放在 XDG 数据目录
+# （issue #4 实测：~/.local/share/CodeBuddyExtension/Data/Public/auth/Tencent-Cloud.coding-copilot.info，
+#  JSON 结构与桌面端一致，签到/成长中心接口全部照常工作）
+CLI_AUTH_BASENAME = os.path.join("CodeBuddyExtension", "Data", "Public", "auth",
+                                 "Tencent-Cloud.coding-copilot.info")
 
 # 伪 HTTP 码：区分"没拿到响应"的两种原因
 CODE_NO_NETWORK = -1   # 连不上/超时
@@ -145,10 +150,12 @@ def find_auth_file():
         return (override if os.path.exists(override) else None), [override]
     home = os.path.expanduser("~")
     local = os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")
+    xdg_data = os.environ.get("XDG_DATA_HOME") or os.path.join(home, ".local", "share")
     candidates = [
-        os.path.join(local, AUTH_BASENAME),                                  # Windows
-        os.path.join(home, "Library", "Application Support", AUTH_BASENAME),  # macOS
-        os.path.join(home, ".config", AUTH_BASENAME),                        # Linux
+        os.path.join(local, AUTH_BASENAME),                                  # Windows 桌面端
+        os.path.join(home, "Library", "Application Support", AUTH_BASENAME),  # macOS 桌面端
+        os.path.join(xdg_data, CLI_AUTH_BASENAME),                           # Linux CodeBuddy CLI
+        os.path.join(home, ".config", AUTH_BASENAME),                        # Linux（旧猜测，保留）
         os.path.join(home, ".workbuddy", "auth", "workbuddy-desktop.info"),  # 兜底
     ]
     for c in candidates:
