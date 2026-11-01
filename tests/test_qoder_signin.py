@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import time
 import unittest
@@ -137,6 +138,107 @@ class WindowsLoadSessionTests(unittest.TestCase):
             with self.assertRaises(qoder.AuthFormatError) as ctx:
                 qoder._load_session_windows()
         self.assertIn("DECRYPT_FAILED", str(ctx.exception))
+
+
+class LinuxLoadSessionTests(unittest.TestCase):
+    """Linux 分支的编排逻辑，与 WindowsLoadSessionTests 同构。"""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / "com.qodercn.app.stable"
+        self.root.mkdir()
+        (self.root / "auth.v1.dat").write_bytes(b"v11" + b"\x00" * 64)
+
+    def test_returns_first_readable_session(self):
+        with mock.patch.object(qoder, "find_linux_auth_dirs", return_value=[self.root]), \
+             mock.patch.object(qoder, "find_linux_runtime", return_value="/usr/lib/electron43/electron"), \
+             mock.patch.object(qoder, "_read_linux_session_retry",
+                               return_value={"token": "dt-linux"}) as read:
+            session = qoder._load_session_linux()
+        self.assertEqual(session["token"], "dt-linux")
+        self.assertEqual(session["_auth_dir"], str(self.root))
+        read.assert_called_once_with("/usr/lib/electron43/electron", self.root)
+
+    def test_directory_without_credentials_is_no_auth(self):
+        (self.root / "auth.v1.dat").unlink()
+        with mock.patch.object(qoder, "find_linux_auth_dirs", return_value=[self.root]), \
+             mock.patch.object(qoder, "find_linux_runtime", return_value="/fake/electron"):
+            with self.assertRaises(qoder.NoAuthError) as ctx:
+                qoder._load_session_linux()
+        self.assertIn("尚未登录", str(ctx.exception))
+
+    def test_format_error_is_aggregated_not_swallowed(self):
+        with mock.patch.object(qoder, "find_linux_auth_dirs", return_value=[self.root]), \
+             mock.patch.object(qoder, "find_linux_runtime", return_value="/fake/electron"), \
+             mock.patch.object(qoder, "_read_linux_session_retry",
+                               side_effect=qoder.AuthFormatError("DECRYPT_FAILED")):
+            with self.assertRaises(qoder.AuthFormatError) as ctx:
+                qoder._load_session_linux()
+        self.assertIn("DECRYPT_FAILED", str(ctx.exception))
+
+
+class LinuxRuntimeTests(unittest.TestCase):
+    def test_qoder_exe_override_must_be_executable(self):
+        with mock.patch.dict(os.environ, {"QODER_EXE": "/nonexistent/electron"}):
+            with self.assertRaises(qoder.NoAuthError):
+                qoder.find_linux_runtime()
+
+    def test_no_runtime_found_is_no_auth(self):
+        with mock.patch.dict(os.environ, {"QODER_EXE": ""}), \
+             mock.patch.object(qoder.glob, "glob", return_value=[]):
+            with self.assertRaises(qoder.NoAuthError) as ctx:
+                qoder.find_linux_runtime()
+        self.assertIn("Electron", str(ctx.exception))
+
+
+class LinuxHelperTests(unittest.TestCase):
+    def reply(self, payload, **kwargs):
+        with mock.patch.object(qoder.subprocess, "run") as run:
+            run.return_value = mock.Mock(stdout=json.dumps(payload).encode("utf-8"), **kwargs)
+            return qoder._run_linux_auth_helper("/fake/electron", "/f/auth.v1.dat"), run
+
+    def test_writes_helper_app_and_returns_session(self):
+        captured = {}
+
+        def record(argv, **kwargs):
+            captured["argv"] = argv
+            captured["package"] = json.loads(
+                (Path(argv[-2]) / "package.json").read_text())
+            return mock.Mock(stdout=json.dumps(
+                {"ok": True, "version": 1, "session": {"token": "tk"}}).encode("utf-8"))
+
+        with mock.patch.object(qoder.subprocess, "run", side_effect=record) as run:
+            session = qoder._run_linux_auth_helper("/fake/electron", "/f/auth.v1.dat")
+        self.assertEqual(session["token"], "tk")
+        argv = captured["argv"]
+        self.assertEqual(argv[0], "/fake/electron")
+        self.assertIn("--headless", argv)
+        self.assertEqual(argv[-1], "/f/auth.v1.dat")
+        self.assertEqual(captured["package"]["name"], "Qoder CN App")
+
+    def test_failure_reasons_map_to_exceptions(self):
+        for reason, cls in (("AUTH_MISSING", qoder.NoAuthError),
+                            ("KEYSTORE_UNAVAILABLE", qoder.NoAuthError),
+                            ("DECRYPT_FAILED", qoder.AuthFormatError)):
+            with mock.patch.object(qoder.subprocess, "run") as run:
+                run.return_value = mock.Mock(stdout=json.dumps(
+                    {"ok": False, "version": 1, "reason": reason}).encode("utf-8"))
+                with self.assertRaises(cls):
+                    qoder._run_linux_auth_helper("/fake/electron", "/f/auth.v1.dat")
+
+    def test_timeout_is_no_auth(self):
+        with mock.patch.object(qoder.subprocess, "run",
+                               side_effect=qoder.subprocess.TimeoutExpired(cmd="x", timeout=1)):
+            with self.assertRaises(qoder.NoAuthError):
+                qoder._run_linux_auth_helper("/fake/electron", "/f/auth.v1.dat")
+
+    def test_helper_failure_is_retried_then_reported(self):
+        with mock.patch.object(qoder, "_run_linux_auth_helper",
+                               side_effect=qoder.AuthFormatError("DECRYPT_FAILED")) as helper:
+            with self.assertRaises(qoder.AuthFormatError):
+                qoder._read_linux_session_retry("/fake/electron", Path("/tmp/x"))
+        self.assertEqual(helper.call_count, 3)
 
 
 class ClaimTests(unittest.TestCase):

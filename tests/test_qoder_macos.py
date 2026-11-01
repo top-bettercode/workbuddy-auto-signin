@@ -251,7 +251,8 @@ class LoadSessionMacTests(unittest.TestCase):
         mac.assert_called_once()
 
     def test_dispatch_rejects_other_platforms_with_token_hint(self):
-        with mock.patch.object(qoder.sys, "platform", "linux"), \
+        # Linux 现在是受支持的平台，这里用真正未支持的平台验证兜底提示。
+        with mock.patch.object(qoder.sys, "platform", "freebsd"), \
              mock.patch.object(qoder, "IS_WINDOWS", False):
             with self.assertRaises(qoder.NoAuthError) as ctx:
                 qoder.load_session()

@@ -396,17 +396,18 @@ Windows 按 `WORKBUDDY_EXE → 默认安装目录 → 注册表` 的顺序发现
 
 ### 前置条件
 
-- 已安装并**登录过 Qoder CN 桌面端**（Windows / macOS）
+- 已安装并**登录过 Qoder CN 桌面端**（Windows / macOS / Linux）
 - 本机有 **Python 3**（与 WorkBuddy 共用即可，无第三方包）
 
-> 自动读取登录态支持 **Windows** 与 **macOS**：
+> 自动读取登录态支持 **Windows**、**macOS** 与 **Linux**：
 >
 > - **Windows**：凭据由 DPAPI 保护，密钥从 `Local State` 解出，AES-256-GCM 解密。
 > - **macOS**：密钥在登录钥匙串（`Qoder CN App Safe Storage`），凭据是 AES-128-CBC。
->   Python 标准库没有 AES，这一步交给客户端自带的 Electron 运行时（Node）完成，
->   所以同样不需要 `pip install`。
->
-> Linux 暂无自动读取，可设 `QODER_TOKEN`，但令牌会过期，不推荐长期保存。
+> - **Linux**：凭据是 `v11` 前缀的 AES-256-GCM，密钥由 Chromium OSCrypt 管理
+>   （本机没有 libsecret 时落在 KWallet）。Python 标准库没有 AES 也够不着密钥环，
+>   这一步交给系统 Electron 运行时的 `safeStorage`（`/usr/lib/electron*/electron`，
+>   装 Qoder 桌面端时已作为依赖装好），以 `--headless` 运行，定时任务无显示器也能用。
+>   macOS 与 Linux 都不引入 `pip install`。
 
 ### 一键安装（Windows）
 
