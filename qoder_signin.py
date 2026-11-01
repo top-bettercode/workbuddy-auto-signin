@@ -11,9 +11,11 @@ Qoder CN 个人用户每天可在桌面端领取 100 通用 Credits。活动按 
   POST {base}/sash/api/v1/me/campaigns/{campaignId}/claim      （幂等）
 
 Windows 上凭据由 DPAPI + AES-256-GCM 保护，macOS 上由钥匙串 + AES-128-CBC
+保护，Linux 上由 Chromium OSCrypt（libsecret/KWallet/basic 兜底）+ AES-256-GCM
 保护。解密只用标准库 + 平台自带能力：Windows 用 DPAPI / CNG（装了 cryptography
-时优先用它），macOS 用钥匙串 + 客户端自带的 Electron 运行时（Node），都不强依赖
-第三方包。两种平台都不会打印令牌，也不会改写登录态文件。
+时优先用它），macOS/Linux 都把「解密」这一步交给客户端/系统自带的 Electron
+运行时（safeStorage 内部就是 Chromium 的 OSCrypt），都不强依赖第三方包。三个
+平台都不会打印令牌，也不会改写登录态文件。
 
 用法：
   python qoder_signin.py auto      # 领取今日 Credits，输出一行 JSON
@@ -41,7 +43,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # 活动固定按 UTC+8 刷新，与运行机器的本地时区无关。
 TZ_CN = timezone(timedelta(hours=8))
@@ -365,13 +367,17 @@ def _mac_keychain_password():
     return password
 
 
-def _mac_auth_error(reason):
+def _auth_error(reason):
+    """把 Electron 解密助手的失败原因映射为异常，macOS 与 Linux 共用。"""
     if reason == "AUTH_MISSING":
-        return NoAuthError("登录态文件不存在或不可读，请先打开 Qoder CN 桌面端完成登录")
+        return NoAuthError("登录态文件不存在或不可读，请先打开 Qoder 桌面端完成登录")
+    if reason == "KEYSTORE_UNAVAILABLE":
+        return NoAuthError("系统密钥环不可用（libsecret/KWallet/钥匙串），"
+                           "请在桌面会话内运行本脚本")
     if reason == "UNSUPPORTED_FORMAT":
         return AuthFormatError("登录态格式无法识别，客户端可能已升级；请更新脚本")
     if reason == "DECRYPT_FAILED":
-        return AuthFormatError("登录态解密失败（钥匙串密钥与凭据不匹配），请重新登录桌面端")
+        return AuthFormatError("登录态解密失败（密钥环密钥与凭据不匹配），请重新登录桌面端")
     if reason == "TOKEN_MISSING":
         return AuthFormatError("登录态中没有有效 token，请重新登录桌面端")
     return AuthFormatError("登录态读取失败（%s）" % (reason or "UNKNOWN"))
@@ -405,7 +411,7 @@ def _run_mac_auth_helper(exe, request):
     if not isinstance(reply, dict) or reply.get("version") != 1:
         raise AuthFormatError("登录态助手返回格式不符")
     if reply.get("ok") is not True:
-        raise _mac_auth_error(reply.get("reason"))
+        raise _auth_error(reply.get("reason"))
     session = reply.get("session")
     if not isinstance(session, dict) or not isinstance(session.get("token"), str):
         raise AuthFormatError("登录态助手没有返回 token")
@@ -458,13 +464,195 @@ def _load_session_mac():
                           % "；".join(errors), looked_in)
 
 
+# ---------------------------------------------------------------- Linux 登录态
+#
+# Linux 上 Qoder 的 auth.v1.dat 是 "v11" 前缀 + 12 字节 nonce + AES-256-GCM，
+# 密钥由 Chromium OSCrypt 管理：优先 libsecret，其次 KWallet（本机常见），
+# 都不可用时回退到硬编码口令。密钥条目按应用名（"Qoder CN App"）存取。
+# Python 标准库既没有 AES 也访问不了 KWallet，所以复用 macOS 的思路：把
+# 「解密」整步交给系统里自带的 Electron 运行时——safeStorage API 内部就是
+# Chromium 的 OSCrypt，让它自己去找密钥。必须以完整应用（而非
+# ELECTRON_RUN_AS_NODE）方式启动，safeStorage 才存在；--headless 保证在
+# 定时任务等无显示器的场景下也能运行。
+
+LINUX_HELPER_PACKAGE_JSON = {
+    "name": "Qoder CN App",
+    "productName": "Qoder CN App",
+    "version": "1.0.0",
+    "main": "main.js",
+}
+
+LINUX_HELPER_MAIN_JS = r"""
+'use strict';
+const { app, safeStorage } = require('electron');
+const fs = require('fs');
+const failure = reason => reply({ok: false, reason});
+let replied = false;
+function reply(value) {
+  if (replied) return;
+  replied = true;
+  process.stdout.write(JSON.stringify({version: 1, ...value}),
+                       () => app.exit(value.ok ? 0 : 1));
+}
+const object = x => x !== null && typeof x === 'object' && !Array.isArray(x);
+function decrypt(file) {
+  if (typeof file !== 'string' || !file) failure('INVALID_FORMAT');
+  let raw;
+  try { raw = fs.readFileSync(file); }
+  catch (_) { failure('AUTH_MISSING'); }
+  if (raw.slice(0, 3).toString() !== 'v11') failure('UNSUPPORTED_FORMAT');
+  let text;
+  try { text = safeStorage.decryptString(raw); }
+  catch (_) { failure('DECRYPT_FAILED'); }
+  let session;
+  try { session = JSON.parse(text); }
+  catch (err) { failure('UNSUPPORTED_FORMAT'); }
+  if (!object(session)) failure('UNSUPPORTED_FORMAT');
+  const token = session.token;
+  if (typeof token !== 'string' || !token.length || token.length > 32768 ||
+      !/^[A-Za-z0-9._~+\/-]+=*$/.test(token)) failure('TOKEN_MISSING');
+  return {token: token,
+          expiresAt: typeof session.expiresAt === 'string' ? session.expiresAt : null};
+}
+app.setPath('userData', require('os').tmpdir() + '/qoder-signin-helper');
+app.whenReady().then(() => {
+  if (!safeStorage.isEncryptionAvailable()) { failure('KEYSTORE_UNAVAILABLE'); return; }
+  try { reply({ok: true, session: decrypt(process.argv[process.argv.length - 1])}); }
+  catch (err) { failure((err && err.reason) || 'HELPER_PROTOCOL'); }
+});
+"""
+
+
+def find_linux_runtime():
+    override = os.environ.get("QODER_EXE")
+    if override:
+        path = os.path.abspath(os.path.expanduser(override))
+        if not os.path.isfile(path) or not os.access(path, os.X_OK):
+            raise NoAuthError("QODER_EXE 不是可用的可执行文件：%s" % path)
+        return path
+    candidates = []
+    for base in ("/usr/lib", "/usr/lib64", "/usr/local/lib"):
+        candidates += glob.glob(os.path.join(base, "electron*", "electron"))
+    candidates += glob.glob("/usr/bin/electron*")
+    # electron43 > electron9：版本号大的排前面。
+    candidates.sort(key=lambda p: [int(x) if x.isdigit() else 0
+                                   for x in os.path.basename(os.path.dirname(p))
+                                   .replace("electron", "").split(".")], reverse=True)
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return os.path.abspath(path)
+    raise NoAuthError("没找到系统 Electron 运行时（/usr/lib/electron*/electron），"
+                      "请安装 Qoder 桌面端依赖的 Electron 包，或用 QODER_EXE 指定")
+
+
+def find_linux_auth_dirs():
+    override = os.environ.get("QODER_AUTH_DIR")
+    if override:
+        return [Path(override).expanduser()]
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    try:
+        roots = sorted(glob.glob(str(base / AUTH_DIR_GLOB)),
+                       key=os.path.getmtime, reverse=True)
+    except OSError:
+        roots = []
+    return [Path(r) for r in roots]
+
+
+def _run_linux_auth_helper(exe, auth_file):
+    """把凭据路径交给系统 Electron 的 safeStorage 解密，令牌经 stdout 返回。
+
+    safeStorage 只在完整应用进程里可用，所以先在临时目录写出 helper 应用
+    （package.json 的 name 必须与桌面端一致，OSCrypt 才会取到同一个密钥）。
+    环境变量里剔除 NODE_/ELECTRON_/QODER_ 前缀，避免外层 shell 的配置干扰。
+    """
+    import shutil
+    import tempfile
+    app_dir = tempfile.mkdtemp(prefix="qoder-signin-")
+    try:
+        with open(os.path.join(app_dir, "package.json"), "w", encoding="utf-8") as handle:
+            json.dump(LINUX_HELPER_PACKAGE_JSON, handle)
+        with open(os.path.join(app_dir, "main.js"), "w", encoding="utf-8") as handle:
+            handle.write(LINUX_HELPER_MAIN_JS)
+        env = {key: value for key, value in os.environ.items()
+               if not key.upper().startswith(("NODE_", "ELECTRON_", "QODER_"))}
+        try:
+            process = subprocess.run(
+                [exe, "--headless", "--disable-gpu", app_dir, str(auth_file)],
+                capture_output=True, timeout=MAC_HELPER_TIMEOUT, env=env, shell=False)
+        except subprocess.TimeoutExpired:
+            raise NoAuthError("登录态解密超时，请稍后重试") from None
+        except OSError:
+            raise NoAuthError("Electron 运行时无法启动，请检查安装是否完整") from None
+
+        try:
+            reply = json.loads(process.stdout.decode("utf-8"))
+        except (ValueError, UnicodeError):
+            raise AuthFormatError("登录态助手返回了无法解析的结果") from None
+        if not isinstance(reply, dict) or reply.get("version") != 1:
+            raise AuthFormatError("登录态助手返回格式不符")
+        if reply.get("ok") is not True:
+            raise _auth_error(reply.get("reason"))
+        session = reply.get("session")
+        if not isinstance(session, dict) or not isinstance(session.get("token"), str):
+            raise AuthFormatError("登录态助手没有返回 token")
+        return session
+    finally:
+        shutil.rmtree(app_dir, ignore_errors=True)
+
+
+def _read_linux_session_retry(runtime, root, attempts=3):
+    """客户端可能正在重写凭据，读到半截就短暂重试。
+
+    只重试格式/解密类失败；运行时缺失、密钥环不可用属于确定性错误，重试
+    无意义（超时更不该重试三次，否则最坏要等 3 倍超时）。
+    """
+    last = None
+    for i in range(attempts):
+        try:
+            return _run_linux_auth_helper(runtime, root / AUTH_FILE)
+        except AuthFormatError as exc:
+            last = exc
+            if i + 1 < attempts:
+                time.sleep(0.25)
+    raise last
+
+
+def _load_session_linux():
+    runtime = find_linux_runtime()
+    dirs = find_linux_auth_dirs()
+    looked_in = [str(d) for d in dirs]
+    if not dirs:
+        raise NoAuthError("没找到 Qoder 登录态目录（~/.config/%s），"
+                          "请先安装并登录 Qoder 桌面端" % AUTH_DIR_GLOB, looked_in)
+
+    candidates = [d for d in dirs if (d / AUTH_FILE).is_file()]
+    if not candidates:
+        raise NoAuthError("Qoder 桌面端尚未登录（%s）"
+                          % "；".join("%s: 未登录" % d.name for d in dirs), looked_in)
+
+    errors = []
+    for root in candidates:
+        try:
+            session = _read_linux_session_retry(runtime, root)
+        except QoderAuthError as exc:
+            errors.append("%s: %s" % (root.name, exc))
+            continue
+        session["_auth_dir"] = str(root)
+        return session
+
+    raise AuthFormatError("Qoder 登录态读取失败（%s），请重新登录桌面端后重试"
+                          % "；".join(errors), looked_in)
+
+
 def load_session():
     if sys.platform == "darwin":
         return _load_session_mac()
-    if not IS_WINDOWS:
-        raise NoAuthError("自动读取 Qoder CN 登录态支持 Windows 与 macOS；"
-                          "其他平台请设置 QODER_TOKEN")
-    return _load_session_windows()
+    if IS_WINDOWS:
+        return _load_session_windows()
+    if sys.platform.startswith("linux"):
+        return _load_session_linux()
+    raise NoAuthError("自动读取 Qoder 登录态支持 Windows / macOS / Linux；"
+                      "其他平台请设置 QODER_TOKEN")
 
 
 def _load_session_windows():
@@ -527,7 +715,8 @@ def _token_expired(sess):
 # 安装目录里自带的 runtime-info.exe，取客户端平时使用的那一份。找不到组件
 # 就退回普通请求，不影响主流程。
 
-UMID_REL_PATH = ("resources", "umid", "runtime-info.exe")
+UMID_REL_PATH = ("resources", "umid", "runtime-info.exe") if IS_WINDOWS \
+    else ("umid", "runtime-info")
 
 
 def _registry_roots():
@@ -609,18 +798,29 @@ def _umid_candidates():
     override = os.environ.get("QODER_UMID_EXE")
     if override:
         return [Path(override).expanduser()]
-    local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    prog = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
-    prog86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
-    roots = [
-        local / "Programs" / "Qoder CN",
-        prog / "Qoder CN",
-        prog86 / "Qoder CN",
-        local / "Programs" / "Qoder",
-        prog / "Qoder",
-        prog86 / "Qoder",
-    ]
-    roots += _registry_roots() + _running_roots()
+    if IS_WINDOWS:
+        local = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        prog = Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        prog86 = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+        roots = [
+            local / "Programs" / "Qoder CN",
+            prog / "Qoder CN",
+            prog86 / "Qoder CN",
+            local / "Programs" / "Qoder",
+            prog / "Qoder",
+            prog86 / "Qoder",
+        ]
+        roots += _registry_roots() + _running_roots()
+    elif sys.platform.startswith("linux"):
+        roots = [
+            Path("/usr/lib/qoder-cn"),
+            Path("/usr/lib/qoder-cn-ide"),
+            Path("/usr/share/qoder-cn"),
+            Path("/usr/share/qoder-cn-ide"),
+            Path.home() / ".local" / "share" / "qoder-cn",
+        ]
+    else:
+        return []
     seen, uniq = set(), []
     for root in roots:
         key = str(root).lower()
@@ -630,9 +830,17 @@ def _umid_candidates():
     return [root.joinpath(*UMID_REL_PATH) for root in uniq]
 
 
+def _platform_auth_dirs():
+    if sys.platform == "darwin":
+        return find_mac_auth_dirs()
+    if IS_WINDOWS:
+        return find_auth_dirs()
+    return find_linux_auth_dirs()
+
+
 def _machine_id(auth_dir):
     candidates = [Path(auth_dir)] if auth_dir else []
-    candidates += [d for d in find_auth_dirs() if d not in candidates]
+    candidates += [d for d in _platform_auth_dirs() if d not in candidates]
     for root in candidates:
         try:
             value = (root / "auth.machine-id").read_text(encoding="utf-8").strip()
@@ -676,6 +884,12 @@ def risk_headers(auth_dir=None):
                 "aarch64": "aarch64", "arm64": "aarch64"}.get(
                     platform.machine().lower(), "x86_64")
         headers["Cosy-MachineOS"] = "%s_windows" % arch
+        headers["Cosy-MachineHostname"] = socket.gethostname()
+    elif sys.platform.startswith("linux"):
+        arch = {"x86_64": "x86_64", "amd64": "x86_64",
+                "aarch64": "aarch64", "arm64": "aarch64"}.get(
+                    platform.machine().lower(), "x86_64")
+        headers["Cosy-MachineOS"] = "%s_linux" % arch
         headers["Cosy-MachineHostname"] = socket.gethostname()
 
     exe = next((p for p in _umid_candidates() if p.is_file()), None)
