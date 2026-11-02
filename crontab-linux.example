@@ -1,0 +1,28 @@
+# workbuddy-auto-signin Linux crontab 示例（crontab -e 后粘贴，或 crontab < 本文件）
+#
+# 两个包装脚本与本文件同仓库：workbuddy-daily-linux.sh / qoder-daily-linux.sh。
+# 飞书通知凭据由脚本从 ~/.zshrc（含其 source 引用的文件）自动提取，无需在此配置；
+# Qoder 的 QODER_TOKEN 放在 ~/.config/workbuddy-auto-signin/env。
+# 把 REPO 改成你的仓库绝对路径；日志统一写在 ~/.local/share/workbuddy-auto-signin/。
+#
+# 通知策略：当天首次「成功完成」发一条报喜后停发；失败则每轮都告警，恢复成功后再报平安。
+# 因此每 4 小时的轮询与 00:05 的全量跑共用同一脚本即可，幂等且不会重复轰炸。
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
+REPO=/home/you/data/repositories/workbuddy-auto-signin
+
+# 1) 每天 00:05 全量：签到 + 成长中心 + CodeBuddy 对话（对话每天只做一次）
+5 0 * * * "$REPO"/workbuddy-daily-linux.sh
+
+# 2) 每 4 小时：补签（未签才签）+ 成长中心轮询（对应 macOS StartInterval 14400）；同一脚本幂等
+0 */4 * * * "$REPO"/workbuddy-daily-linux.sh
+
+# 3) 开机补跑（对应 macOS RunAtLoad，补上关机/睡眠期间错过的签到）
+@reboot "$REPO"/workbuddy-daily-linux.sh
+
+# 4) Qoder CN 每日 100 Credits（需 ~/.config/workbuddy-auto-signin/env 里填 QODER_TOKEN）：
+#    10:05 主领取（Credits 每天 10:00 刷新），11:05/15:05/19:05/23:05 兜底，与 macOS launchd 一致
+5 10,11,15,19,23 * * * "$REPO"/qoder-daily-linux.sh
+
+# 5) Qoder 开机补跑（对应 macOS 安装器的 RunAtLoad）
+@reboot "$REPO"/qoder-daily-linux.sh
