@@ -5,7 +5,7 @@
 ~/.zshrc 中提取并 export）：
   FEISHU_SELF_APP_ID           自建应用 app_id
   FEISHU_SELF_APP_SECRET       自建应用 app_secret
-  FEISHU_NOTIFY_RECEIVE_ID     收信方 ID（由环境变量配置）
+  FEISHU_NOTIFY_RECEIVE_ID     收信方 ID（必填，由调用方从私有配置提取）
   FEISHU_NOTIFY_RECEIVE_ID_TYPE ID 类型（默认 user_id，可选 open_id/union_id/email/chat_id）
 
 仅使用标准库（urllib），默认校验证书。失败一律打印到 stderr 并以非 0 退出，
@@ -94,6 +94,9 @@ def main():
 
     if not app_id or not app_secret:
         print("feishu_notify: 缺少 FEISHU_SELF_APP_ID / FEISHU_SELF_APP_SECRET，跳过通知", file=sys.stderr)
+        return 2
+    if not receive_id:
+        print("feishu_notify: 缺少 FEISHU_NOTIFY_RECEIVE_ID，跳过通知", file=sys.stderr)
         return 2
     if len(sys.argv) < 2:
         print("用法: feishu_notify.py <消息文本>", file=sys.stderr)
