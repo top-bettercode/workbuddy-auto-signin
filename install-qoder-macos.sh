@@ -70,7 +70,7 @@ if ! "$PYTHON" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) 
   exit 1
 fi
 if [ ! -f "$SCRIPT" ]; then
-  echo "✗ 找不到 $SCRIPT（请在仓库目录里运行本脚本）"
+  echo "✗ 找不到 ${SCRIPT}（请在仓库目录里运行本脚本）"
   exit 1
 fi
 
@@ -156,7 +156,7 @@ echo "  ✓ 配置已生成并校验"
 # 此时必须直接退出并保留原任务，绝不能继续覆盖配置。
 if [ -f "$PLIST" ]; then
   if ! cp "$PLIST" "$BACKUP"; then
-    die "备份现有配置失败（$BACKUP）。已中止，原任务未被改动"
+    die "备份现有配置失败（${BACKUP}）。已中止，原任务未被改动"
   fi
   echo "  ✓ 已备份现有配置 → $BACKUP"
 fi

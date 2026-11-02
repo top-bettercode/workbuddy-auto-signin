@@ -50,26 +50,47 @@ exec > >(tee -a "$RUN_LOG") 2>&1
 date "+[%Y-%m-%d %H:%M:%S] [daily] start"
 
 # 1) 核心：WorkBuddy 每日签到 + 成长中心（连登补登/兑换、Buddy 旅行礼物/派出、任务、盲盒、能量）
-"$PYTHON" "$REPO/signin.py" auto
+WB_OUT="$("$PYTHON" "$REPO/signin.py" auto)"
 SIGNIN_RC=$?
+printf '%s\n' "$WB_OUT"
 echo "[daily] signin auto exit=$SIGNIN_RC"
+
+# 从输出 JSON 提取 result / report / growth（report、growth 是面向人的中文描述）。
+FIELDS="$(printf '%s\n' "$WB_OUT" | "$PYTHON" -c '
+import json, sys
+lines = [l for l in sys.stdin.read().splitlines() if l.lstrip().startswith("{")]
+try:
+    data = json.loads(lines[-1])
+    for key in ("result", "report", "growth"):
+        print(data.get(key) or "")
+except Exception:
+    pass
+')"
+RESULT="${FIELDS%%$'\n'*}"
+REST="${FIELDS#*$'\n'}"
+REPORT="${REST%%$'\n'*}"
+GROWTH="${REST#*$'\n'}"
 
 # 2) 用 CodeBuddy 完成一次对话（内容 hi），完成「每日登录/成长」里的对话任务。
 #    依赖 CodeBuddy CLI 已登录（凭据持久化在 ~/.codebuddy，本机已登录）。
 #    未登录/失败不影响上面的签到；此步不致命。每天只做一次。
 CODEBUDDY_RC=0
+CODEBUDDY_NOTE="CLI 未安装，已跳过对话"
 if [ -x "$CODEBUDDY" ]; then
   if [ -f "$CHAT_MARKER" ]; then
     echo "[daily] codebuddy 今天已完成对话，跳过"
+    CODEBUDDY_NOTE="今日已完成，跳过"
   else
     echo "[daily] codebuddy conversation: hi"
     timeout 150 "$CODEBUDDY" -p 'hi' --tools '' 2>&1 | head -40
     CODEBUDDY_RC=${PIPESTATUS[0]}
     echo "[daily] codebuddy exit=$CODEBUDDY_RC"
     : > "$CHAT_MARKER"
+    if [ "$CODEBUDDY_RC" -eq 0 ]; then CODEBUDDY_NOTE="对话完成"
+    else CODEBUDDY_NOTE="对话失败（退出码 ${CODEBUDDY_RC}）"; fi
   fi
 else
-  echo "[daily] codebuddy CLI 未找到（$CODEBUDDY），跳过对话步骤"
+  echo "[daily] codebuddy CLI 未找到（${CODEBUDDY}），跳过对话步骤"
 fi
 
 date "+[%Y-%m-%d %H:%M:%S] [daily] done"
@@ -78,11 +99,24 @@ date "+[%Y-%m-%d %H:%M:%S] [daily] done"
 OVERALL_RC=$SIGNIN_RC
 if [ "$CODEBUDDY_RC" -ne 0 ]; then OVERALL_RC=$CODEBUDDY_RC; fi
 
-SUMMARY="WorkBuddy 每日任务 ${TODAY}
-状态: $([ "$OVERALL_RC" -eq 0 ] && echo OK || echo 异常)
-signin auto: exit=$SIGNIN_RC
-codebuddy: exit=$CODEBUDDY_RC
-$(date '+%H:%M:%S') 完成"
+if [ "$OVERALL_RC" -eq 0 ]; then
+  ICON="✅"; TITLE="WorkBuddy 每日任务成功"
+else
+  ICON="🚨"; TITLE="WorkBuddy 每日任务异常"
+fi
+
+SUMMARY="$ICON $TITLE
+📅 $TODAY $(date '+%H:%M')
+🎯 ${REPORT:-签到无详细输出（退出码 ${SIGNIN_RC}）}"
+[ -n "$GROWTH" ] && [ "$GROWTH" != "$REPORT" ] && SUMMARY="$SUMMARY
+🌱 $GROWTH"
+SUMMARY="$SUMMARY
+💬 CodeBuddy 对话：$CODEBUDDY_NOTE"
+
+if [ "$OVERALL_RC" -ne 0 ]; then
+  SUMMARY="$SUMMARY
+🔁 修复前每次运行都会重发本告警，恢复成功后会再报平安"
+fi
 
 if [ "$OVERALL_RC" -eq 0 ]; then
   if [ -f "$NOTIFY_MARKER" ]; then
