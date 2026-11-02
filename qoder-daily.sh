@@ -47,16 +47,42 @@ exec > >(tee -a "$RUN_LOG") 2>&1
 date "+[%Y-%m-%d %H:%M:%S] [qoder] start"
 
 # 核心：领取每日 Credits（接口幂等，重复触发不会重复领取）。
-"$PYTHON" "$REPO/qoder_signin.py" auto
+QODER_OUT="$("$PYTHON" "$REPO/qoder_signin.py" auto)"
 QODER_RC=$?
+printf '%s\n' "$QODER_OUT"
 echo "[qoder] qoder_signin auto exit=$QODER_RC"
 
 date "+[%Y-%m-%d %H:%M:%S] [qoder] done"
 
-SUMMARY="Qoder CN 每日任务 ${TODAY}
-状态: $([ "$QODER_RC" -eq 0 ] && echo OK || echo 异常)
-qoder_signin auto: exit=$QODER_RC
-$(date '+%H:%M:%S') 完成"
+# 从输出 JSON 提取 result / report（report 本身是面向人的中文描述），拼装通知文案。
+FIELDS="$(printf '%s\n' "$QODER_OUT" | "$PYTHON" -c '
+import json, sys
+lines = [l for l in sys.stdin.read().splitlines() if l.lstrip().startswith("{")]
+try:
+    data = json.loads(lines[-1])
+    print(data.get("result") or "")
+    print(data.get("report") or "")
+except Exception:
+    pass
+')"
+RESULT="${FIELDS%%$'\n'*}"
+REPORT="${FIELDS#*$'\n'}"
+
+case "$RESULT" in
+  CLAIMED)  ICON="✅"; TITLE="Qoder 积分领取成功" ;;
+  ALREADY)  ICON="✅"; TITLE="Qoder 今日积分已领取，无需重复" ;;
+  INACTIVE) ICON="ℹ️"; TITLE="Qoder 当前没有可领取的积分活动" ;;
+  *)        ICON="🚨"; TITLE="Qoder 每日积分任务失败（退出码 ${QODER_RC}）" ;;
+esac
+
+SUMMARY="$ICON $TITLE
+📅 $TODAY $(date '+%H:%M')
+${REPORT:-脚本没有输出详细结果}"
+
+if [ "$QODER_RC" -ne 0 ]; then
+  SUMMARY="$SUMMARY
+🔁 修复前每次运行都会重发本告警，恢复成功后会再报平安"
+fi
 
 if [ "$QODER_RC" -eq 0 ]; then
   if [ -f "$NOTIFY_MARKER" ]; then
