@@ -17,11 +17,27 @@ CHAT_MARKER="/tmp/workbuddy-codebuddy-chat-${TODAY}.done"
 NOTIFY_MARKER="/tmp/workbuddy-feishu-notify-${TODAY}.done"
 RUN_LOG="/tmp/workbuddy-daily-${TODAY}.log"
 
-# 从 ~/.zshrc 提取飞书自建应用凭据与收信配置（launchd 不会自动 source .zshrc）。
+# 从 ~/.zshrc 提取飞书自建应用凭据与收信配置（launchd 不会自动 source .zshrc，
+# 这里只做文本解析，不执行任何配置文件）。~/.zshrc 自身的定义优先；找不到时
+# 跟进 . / source 指令引用的文件（如 $HOME/data/repositories/sys/conf/.zshrc）。
 zshrc_export() {
-  local name="$1"
-  grep -E "^[[:space:]]*(export[[:space:]]+)?${name}=" "$HOME/.zshrc" 2>/dev/null | tail -1 \
-    | sed -E "s/^[^=]*=['\"]?([^'\"]*)['\"]?/\1/"
+  local name="$1" ref val=""
+  val=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${name}=" "$HOME/.zshrc" 2>/dev/null | tail -1 \
+    | sed -E "s/^[^=]*=['\"]?([^'\"]*)['\"]?/\1/")
+  if [ -z "$val" ]; then
+    while IFS= read -r ref; do
+      ref=$(printf '%s' "$ref" | sed -E "s/[\"']//g; s/[[:space:]]*#.*$//; s/[[:space:]]+$//")
+      ref="${ref%% *}"
+      ref="${ref//\$HOME/$HOME}"
+      ref="${ref//\~/$HOME}"
+      [ -f "$ref" ] || continue
+      val=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${name}=" "$ref" 2>/dev/null | tail -1 \
+        | sed -E "s/^[^=]*=['\"]?([^'\"]*)['\"]?/\1/")
+      [ -n "$val" ] && break
+    done < <(grep -E "^[[:space:]]*(source|\.)[[:space:]]+" "$HOME/.zshrc" 2>/dev/null \
+      | sed -E "s/^[[:space:]]*(source|\.)[[:space:]]+//")
+  fi
+  printf '%s\n' "$val"
 }
 export FEISHU_SELF_APP_ID="$(zshrc_export FEISHU_SELF_APP_ID)"
 export FEISHU_SELF_APP_SECRET="$(zshrc_export FEISHU_SELF_APP_SECRET)"
