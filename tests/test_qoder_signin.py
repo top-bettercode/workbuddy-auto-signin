@@ -215,7 +215,7 @@ class LinuxHelperTests(unittest.TestCase):
         self.assertEqual(argv[0], "/fake/electron")
         self.assertIn("--headless", argv)
         self.assertEqual(argv[-1], "/f/auth.v1.dat")
-        self.assertEqual(captured["package"]["name"], "Qoder CN App")
+        self.assertEqual(captured["package"]["name"], "qoder-cn")
 
     def test_failure_reasons_map_to_exceptions(self):
         for reason, cls in (("AUTH_MISSING", qoder.NoAuthError),
@@ -316,6 +316,35 @@ class ClaimTests(unittest.TestCase):
         self.assertEqual(out["result"], "ERROR")
         self.assertTrue(out["needs_attention"])
         self.assertEqual(out["campaign"], None)
+
+
+class LinuxCliWasmTests(unittest.TestCase):
+    def test_wasm_extract_picks_credential_blob(self):
+        import base64
+        import tempfile
+        from pathlib import Path
+        filler = base64.b64encode(b"\x00asm\x01" + b"A" * 64).decode()
+        target = base64.b64encode(b"\x00asm\x01" + b"credential_storage_decrypt" + b"B" * 64).decode()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "qoderclicn"
+            exe.write_text(filler + "junk" + target + "tail", encoding="ascii")
+            out = qoder.find_linux_cli_auth_wasm(str(exe))
+            try:
+                wasm = Path(out).read_bytes()
+                self.assertIn(b"credential_storage_decrypt", wasm)
+            finally:
+                Path(out).unlink(missing_ok=True)
+
+    def test_wasm_extract_missing_blob_raises(self):
+        import base64
+        import tempfile
+        from pathlib import Path
+        filler = base64.b64encode(b"\x00asm\x01" + b"A" * 64).decode()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / "qoderclicn"
+            exe.write_text(filler, encoding="ascii")
+            with self.assertRaises(qoder.AuthFormatError):
+                qoder.find_linux_cli_auth_wasm(str(exe))
 
 
 class OutputTests(unittest.TestCase):

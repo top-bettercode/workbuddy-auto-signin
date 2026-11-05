@@ -29,6 +29,8 @@ Windows 上凭据由 DPAPI + AES-256-GCM 保护，macOS 上由钥匙串 + AES-12
 """
 
 import base64
+import binascii
+import shutil
 import glob
 import json
 import os
@@ -479,16 +481,20 @@ def _load_session_mac():
 #
 # Linux 上 Qoder 的 auth.v1.dat 是 "v11" 前缀 + 12 字节 nonce + AES-256-GCM，
 # 密钥由 Chromium OSCrypt 管理：优先 libsecret，其次 KWallet（本机常见），
-# 都不可用时回退到硬编码口令。密钥条目按应用名（"Qoder CN App"）存取。
+# 都不可用时回退到硬编码口令。密钥条目按应用名存取；桌面端的包名是
+# qoder-cn（/usr/lib/qoder-cn/app.asar 里的 package.json），OSCrypt 用它
+# 作为 libsecret 条目的 application 属性，助手必须同名才能取到同一个密钥。
 # Python 标准库既没有 AES 也访问不了 KWallet，所以复用 macOS 的思路：把
 # 「解密」整步交给系统里自带的 Electron 运行时——safeStorage API 内部就是
 # Chromium 的 OSCrypt，让它自己去找密钥。必须以完整应用（而非
 # ELECTRON_RUN_AS_NODE）方式启动，safeStorage 才存在；--headless 保证在
-# 定时任务等无显示器的场景下也能运行。
+# 定时任务等无显示器的场景下也能运行；deepin/DTK 版 Electron 用 Qt 起窗，
+# 无显示器时会因加载不了 xcb 插件而崩溃，--ozone-platform=headless 强制
+# 走 Chromium 自带的无头平台，绕开 Qt 插件。
 
 LINUX_HELPER_PACKAGE_JSON = {
-    "name": "Qoder CN App",
-    "productName": "Qoder CN App",
+    "name": "qoder-cn",
+    "productName": "qoder-cn",
     "version": "1.0.0",
     "main": "main.js",
 }
@@ -586,9 +592,14 @@ def _run_linux_auth_helper(exe, auth_file):
             handle.write(LINUX_HELPER_MAIN_JS)
         env = {key: value for key, value in os.environ.items()
                if not key.upper().startswith(("NODE_", "ELECTRON_", "QODER_"))}
+        # Chromium 只在能识别出桌面环境时才启用 libsecret/KWallet 后端，
+        # 定时任务等场景下 XDG_CURRENT_DESKTOP 为空会退回 basic_text，
+        # 导致密钥环不可用。桌面端用什么后端加密，这里就得用同一个。
+        if not env.get("XDG_CURRENT_DESKTOP"):
+            env["XDG_CURRENT_DESKTOP"] = "Deepin"
         try:
             process = subprocess.run(
-                [exe, "--headless", "--disable-gpu", app_dir, str(auth_file)],
+                [exe, "--headless", "--disable-gpu", "--ozone-platform=headless", app_dir, str(auth_file)],
                 capture_output=True, timeout=MAC_HELPER_TIMEOUT, env=env, shell=False)
         except subprocess.TimeoutExpired:
             raise NoAuthError("登录态解密超时，请稍后重试") from None
@@ -656,13 +667,257 @@ def _load_session_linux():
                           % "；".join(errors), looked_in)
 
 
+# ---------------------------------------------------------------- Linux CLI 登录态
+#
+# 桌面端之外，qoderclicn CLI 自己保存一份登录凭据（~/.qoder-cn/.auth/user）：
+# AES-GCM 密文 + 随机 nonce，密钥由客户端自带的 qoder_auth_wasm.wasm 派生，
+# 输入是 machine_id 文件的前 16 字节。Python 没法直接跑 WASM，所以把 wasm 从
+# CLI 二进制里提出来（base64 blob，选中含 credential_storage_decrypt 的那个），
+# 交给系统 node 实例化后调用解密导出，token 经 stdout 返回。凭据明文只进
+# stdout，不落日志。
+
+LINUX_CLI_HELPER_JS = r"""
+'use strict';
+const fs = require('fs');
+const inputLimit = 1 << 22;
+const failure = reason => { throw {reason}; };
+let chunks = [];
+let size = 0;
+function reply(value) {
+  process.stdout.write(JSON.stringify({version: 1, ...value}),
+                       () => process.exit(value.ok ? 0 : 1));
+}
+process.stdin.on('data', c => { size += c.length; if (size > inputLimit) reply({ok: false, reason: 'INVALID_FORMAT'}); else chunks.push(c); });
+process.stdin.on('end', () => {
+  try {
+    const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    const wasm = fs.readFileSync(request.wasmFile);
+    const machineId = fs.readFileSync(request.machineIdFile, 'utf8').trim();
+    const encrypted = fs.readFileSync(request.userFile, 'utf8');
+    if (!machineId) failure('MACHINE_ID_MISSING');
+    const mod = new WebAssembly.Module(wasm);
+    const heap = [];
+    const addObject = v => (heap.push(v), heap.length - 1 + 1028);
+    const getObject = i => heap[i - 1028];
+    let ex;
+    const takeStr = (ptr, len) => new TextDecoder('utf-8', {ignoreBOM: true, fatal: true})
+      .decode(new Uint8Array(ex.memory.buffer).subarray(ptr, ptr + len));
+    const imports = {};
+    for (const imp of WebAssembly.Module.imports(mod)) {
+      imports[imp.name] = function (...args) {
+        if (imp.name.startsWith('__wbg_getRandomValues_')) {
+          require('crypto').randomFillSync(new Uint8Array(ex.memory.buffer).subarray(args[1], args[1] + args[2]));
+          return;
+        }
+        if (imp.name.startsWith('__wbg_crypto_')) return addObject(require('crypto'));
+        if (imp.name.startsWith('__wbg_process_')) return addObject(process);
+        if (imp.name.startsWith('__wbg_versions_')) return addObject(process.versions);
+        if (imp.name.startsWith('__wbg_msCrypto_')) return addObject({});
+        if (imp.name === '__wbindgen_throw') throw new Error(takeStr(args[0], args[1]));
+        if (imp.name === '__wbindgen_object_drop_ref') return;
+        if (imp.name.startsWith('__wbg___wbindgen_is_undefined_')) return getObject(args[0]) === undefined;
+        if (imp.name.startsWith('__wbg___wbindgen_is_object_')) { const v = getObject(args[0]); return typeof v === 'object' && v !== null; }
+        if (imp.name.startsWith('__wbg___wbindgen_is_function_')) return typeof getObject(args[0]) === 'function';
+        if (imp.name.startsWith('__wbg___wbindgen_is_string_')) return typeof getObject(args[0]) === 'string';
+        if (imp.name.startsWith('__wbg_Error_')) return addObject(new Error(takeStr(args[0], args[1])));
+        if (imp.name.startsWith('__wbg_require_')) return addObject(require);
+        if (imp.name.startsWith('__wbg_call_')) { try { return addObject(getObject(args[0]).apply(getObject(args[1]), args.slice(2).map(x => getObject(x)))); } catch (e) { return addObject(e); } }
+        if (imp.name.startsWith('__wbg_new_')) return addObject({});
+        if (imp.name.startsWith('__wbg_now_')) return Date.now();
+        if (imp.name.startsWith('__wbindgen_object_clone_ref')) return addObject(getObject(args[0]));
+        if (imp.name.startsWith('__wbindgen_cast_')) return args[0];
+        if (imp.name.startsWith('__wbg_length_')) return getObject(args[0]).length;
+        if (imp.name.startsWith('__wbg_new_with_length_')) return addObject(new Uint8Array(args[0]));
+        if (imp.name.startsWith('__wbg_subarray_')) return addObject(getObject(args[0]).subarray(args[1], args[2]));
+        if (imp.name.startsWith('__wbg_prototypesetcall_')) return;
+        if (imp.name.startsWith('__wbg_set_')) return;
+        failure('WASM_IMPORT_UNSUPPORTED');
+      };
+    }
+    const instance = new WebAssembly.Instance(mod, { './qoder_auth_wasm_bg.js': imports });
+    ex = instance.exports;
+    const alloc = ex.__wbindgen_export2;
+    const enc = new TextEncoder();
+    const passString = s => {
+      const bytes = enc.encode(s);
+      const ptr = alloc(bytes.length, 1) >>> 0;
+      new Uint8Array(ex.memory.buffer).set(bytes, ptr);
+      return [ptr, bytes.length];
+    };
+    const [dPtr, dLen] = passString(encrypted);
+    const [kPtr, kLen] = passString(machineId.slice(0, 16));
+    const retptr = ex.__wbindgen_add_to_stack_pointer(-16);
+    let plain;
+    try {
+      ex.credential_storage_decrypt(retptr, dPtr, dLen, kPtr, kLen);
+      const dv = new DataView(ex.memory.buffer);
+      const ptr = dv.getInt32(retptr, true) >>> 0;
+      const len = dv.getInt32(retptr + 4, true) >>> 0;
+      const isErr = dv.getInt32(retptr + 12, true);
+      if (isErr) failure('DECRYPT_FAILED');
+      plain = takeStr(ptr, len);
+    } finally {
+      ex.__wbindgen_add_to_stack_pointer(16);
+    }
+    const userInfo = JSON.parse(plain);
+    const token = userInfo.access_token;
+    if (typeof token !== 'string' || !token.length || token.length > 32768 ||
+        !/^[A-Za-z0-9._~+\/-]+=*$/.test(token)) failure('TOKEN_MISSING');
+    let expiresAt = null;
+    if (typeof userInfo.expire_time === 'number' && userInfo.expire_time > 0) {
+      const ms = userInfo.expire_time > 1e12 ? userInfo.expire_time : userInfo.expire_time * 1000;
+      expiresAt = new Date(ms).toISOString();
+    }
+    reply({ok: true, session: {token, expiresAt}});
+  } catch (err) {
+    reply({ok: false, reason: (err && err.reason) || 'HELPER_PROTOCOL'});
+  }
+});
+"""
+
+LINUX_CLI_AUTH_DIR_ENV = "QODER_CLI_AUTH_DIR"
+LINUX_CLI_EXE_ENV = "QODER_CLI_EXE"
+
+
+def find_linux_cli_auth_dir():
+    override = os.environ.get(LINUX_CLI_AUTH_DIR_ENV)
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".qoder-cn" / ".auth"
+
+
+def find_linux_cli_exe():
+    override = os.environ.get(LINUX_CLI_EXE_ENV)
+    if override:
+        path = os.path.abspath(os.path.expanduser(override))
+        if not os.path.isfile(path):
+            raise NoAuthError("QODER_CLI_EXE 指向的文件不存在：%s" % path)
+        return path
+    located = shutil.which("qoderclicn")
+    if located:
+        return os.path.realpath(located)
+    home = Path.home()
+    candidates = sorted(glob.glob(str(home / ".qoder-cn" / "bin" / "qoderclicn" / "qoderclicn-*")))
+    if candidates:
+        return os.path.realpath(candidates[-1])
+    for fallback in (home / ".local" / "bin" / "qoderclicn",):
+        if fallback.is_file():
+            return str(fallback)
+    raise NoAuthError("没找到 qoderclicn CLI（~/.qoder-cn/bin/qoderclicn/），"
+                      "请先安装 Qoder CLI 或用 QODER_CLI_EXE 指定")
+
+
+def find_linux_cli_auth_wasm(exe):
+    """从 CLI 二进制里提取 qoder_auth_wasm（base64 内嵌，选中带
+    credential_storage_decrypt 导出的那个），按二进制特征缓存。"""
+    st = os.stat(exe)
+    cache_dir = Path.home() / ".cache" / "workbuddy-auto-signin"
+    cache_path = cache_dir / ("cli-auth-wasm-%d-%d.wasm" % (st.st_size, int(st.st_mtime)))
+    if cache_path.is_file():
+        return cache_path
+    marker = b"AGFzbQ"   # wasm 头部（\0asm 的 base64）前缀
+    try:
+        blob_data = Path(exe).read_bytes()
+    except OSError:
+        raise NoAuthError("无法读取 Qoder CLI 二进制：%s" % exe)
+    b64chars = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+    pos = blob_data.find(marker)
+    while pos != -1:
+        end = pos
+        while end < len(blob_data) and blob_data[end] in b64chars:
+            end += 1
+        run = blob_data[pos:end]
+        # 相邻 blob 可能被同为 base64 字符的分隔内容连成一个 run，逐个截断补
+        # padding 重试，解不出就跳过这个魔数继续找下一个。
+        for trim in range(0, 4):
+            cut = run[:len(run) - trim] if trim else run
+            try:
+                candidate = base64.b64decode(cut + b"=" * (-len(cut) % 4))
+            except (ValueError, binascii.Error):
+                continue
+            if b"credential_storage_decrypt" in candidate:
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                cache_path.write_bytes(candidate)
+                return cache_path
+        pos = blob_data.find(marker, pos + 8)
+    raise AuthFormatError("CLI 二进制里没有找到 qoder_auth_wasm（客户端可能已变更），请更新脚本")
+
+
+def find_node():
+    node = os.environ.get("QODER_NODE") or shutil.which("node")
+    if not node:
+        raise NoAuthError("没找到 node 运行时（解密 CLI 凭据需要），请安装 node 或用 QODER_NODE 指定")
+    return node
+
+
+def _run_linux_cli_helper(node, wasm_path, auth_dir):
+    request = {"wasmFile": str(wasm_path),
+               "userFile": str(auth_dir / "user"),
+               "machineIdFile": str(auth_dir / "machine_id")}
+    data = json.dumps(dict(request, version=1), ensure_ascii=True).encode("ascii")
+    if len(data) > AUTH_INPUT_LIMIT:
+        raise AuthFormatError("登录态参数过大")
+    env = {key: value for key, value in os.environ.items()
+           if not key.upper().startswith(("NODE_", "ELECTRON_", "QODER_"))}
+    try:
+        process = subprocess.run([node, "-e", LINUX_CLI_HELPER_JS], input=data,
+                                 capture_output=True, timeout=MAC_HELPER_TIMEOUT,
+                                 env=env, shell=False)
+    except subprocess.TimeoutExpired:
+        raise NoAuthError("CLI 登录态解密超时，请稍后重试") from None
+    except OSError:
+        raise NoAuthError("node 无法启动，请检查安装是否完整") from None
+    try:
+        reply = json.loads(process.stdout.decode("utf-8"))
+    except (ValueError, UnicodeError):
+        raise AuthFormatError("CLI 登录态助手返回了无法解析的结果（%s）"
+                              % _helper_diagnosis(process)) from None
+    if not isinstance(reply, dict) or reply.get("version") != 1:
+        raise AuthFormatError("CLI 登录态助手返回格式不符")
+    if reply.get("ok") is not True:
+        raise _auth_error(reply.get("reason"))
+    session = reply.get("session")
+    if not isinstance(session, dict) or not isinstance(session.get("token"), str):
+        raise AuthFormatError("CLI 登录态助手没有返回 token")
+    return session
+
+
+def _load_session_linux_cli():
+    auth_dir = find_linux_cli_auth_dir()
+    user_file = auth_dir / "user"
+    machine_file = auth_dir / "machine_id"
+    if not user_file.is_file() or not machine_file.is_file():
+        raise NoAuthError("没找到 Qoder CLI 登录凭据（%s），请先用 qoderclicn login 登录"
+                          % auth_dir, [str(auth_dir)])
+    exe = find_linux_cli_exe()
+    wasm_path = find_linux_cli_auth_wasm(exe)
+    node = find_node()
+    session = _run_linux_cli_helper(node, wasm_path, auth_dir)
+    session["_auth_dir"] = str(auth_dir)
+    session["_token_source"] = "cli"
+    return session
+
+
 def load_session():
     if sys.platform == "darwin":
         return _load_session_mac()
     if IS_WINDOWS:
         return _load_session_windows()
     if sys.platform.startswith("linux"):
-        return _load_session_linux()
+        try:
+            return _load_session_linux()
+        except QoderAuthError as desktop_exc:
+            # 桌面端登录态缺失/损坏时回退到 qoderclicn CLI 的本地凭据，
+            # 两者独立存储：桌面端升级孤儿化凭据不影响 CLI。
+            try:
+                return _load_session_linux_cli()
+            except NoAuthError as cli_exc:
+                raise NoAuthError("%s；另外 %s" % (desktop_exc, cli_exc),
+                                  desktop_exc.looked_in) from None
+            except QoderAuthError as cli_exc:
+                raise AuthFormatError("%s；CLI 凭据读取也失败：%s"
+                                      % (desktop_exc, cli_exc),
+                                      desktop_exc.looked_in) from None
     raise NoAuthError("自动读取 Qoder 登录态支持 Windows / macOS / Linux；"
                       "其他平台请设置 QODER_TOKEN")
 
@@ -1231,6 +1486,7 @@ def run_doctor():
     token = (os.environ.get("QODER_TOKEN") or "").strip()
     out = {"result": "OK", "version": VERSION, "platform": sys.platform,
            "token_source": "env" if token else "desktop", "needs_attention": False}
+    doctor_token_source = "desktop"
     if token:
         _sensitive_values.add(token)
         out["report"] = "使用环境变量 QODER_TOKEN（无法离线校验有效期）"
@@ -1247,12 +1503,13 @@ def run_doctor():
 
     token = sess["token"]
     _sensitive_values.add(token)
+    doctor_token_source = sess.get("_token_source", "desktop")
     expires = _parse_iso(sess.get("expiresAt"))
     out.update({
         "auth_dir": sess.get("_auth_dir"),
         "token_expires_at": sess.get("expiresAt"),
         "decrypted": True,
-    })
+        "token_source": doctor_token_source})
     exe = next((p for p in _umid_candidates() if p.is_file()), None)
     out["device_component"] = str(exe) if exe else None
     out["device_identity"] = bool(risk_headers(sess.get("_auth_dir"))
