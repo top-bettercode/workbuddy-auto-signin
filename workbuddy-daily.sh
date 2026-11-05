@@ -9,6 +9,13 @@ set -u
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="$(ls -d "$HOME"/.pyenv/versions/*/bin/python3 2>/dev/null | sort -V | tail -1 || command -v python3)"
+# launchd 的 PATH 极小（/usr/bin:/bin:...），而 codebuddy 的 shebang 是
+# 「#!/usr/bin/env node」——不补 PATH 会在启动时报 env: node: No such file
+# or directory（退出码 127）。与 workbuddy-daily-linux.sh 一致：把最新 nvm
+# node 加入 PATH（升级后自动跟随），CLI 位置交给 command -v 解析，不再写死
+# 版本号路径。
+NODEBIN="$(ls -d "$HOME"/.nvm/versions/node/*/bin 2>/dev/null | sort -V | tail -1)"
+[ -n "$NODEBIN" ] && export PATH="$NODEBIN:$PATH"
 CODEBUDDY="$(command -v codebuddy 2>/dev/null || true)"
 export PYTHONIOENCODING="utf-8"
 
