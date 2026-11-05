@@ -8,11 +8,14 @@
   FEISHU_NOTIFY_RECEIVE_ID     收信方 ID（必填，由调用方从私有配置提取）
   FEISHU_NOTIFY_RECEIVE_ID_TYPE ID 类型（默认 user_id，可选 open_id/union_id/email/chat_id）
 
-仅使用标准库（urllib），默认校验证书。失败一律打印到 stderr 并以非 0 退出，
-由调用方决定是否致命（自动化任务里不致命）。
+仅使用标准库（urllib），默认校验证书。发送时在消息末尾附加一行
+「🖥️ <主机名>」——同一收信人可能有多台机器跑同一套任务，靠主机
+标识区分消息来源。失败一律打印到 stderr 并以非 0 退出，由调用方
+决定是否致命（自动化任务里不致命）。
 """
 import json
 import os
+import socket
 import ssl
 import sys
 import time
@@ -68,6 +71,9 @@ def send_text(token, receive_id, receive_id_type, text):
     text = (text or "").strip()
     if len(text) > MAX_TEXT:
         text = text[:MAX_TEXT] + "\n…(已截断)"
+    # 截断后再附加，保证主机标识任何情况下都在消息末尾可见。
+    host = socket.gethostname().split(".")[0] or "unknown-host"
+    text = "%s\n🖥️ %s" % (text, host)
     content = json.dumps({"text": text}, ensure_ascii=False)
     body = {
         "receive_id": receive_id,
