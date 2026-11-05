@@ -383,6 +383,16 @@ def _auth_error(reason):
     return AuthFormatError("登录态读取失败（%s）" % (reason or "UNKNOWN"))
 
 
+def _helper_diagnosis(process, limit=200):
+    """解密助手 stdout 无法解析时，把退出码与 stderr 尾部带进错误便于定位。
+    stdout 不落文本——成功回复里含 token，只报字节数。"""
+    detail = "助手退出码 %s，stdout %d 字节" % (process.returncode, len(process.stdout))
+    err = process.stderr.decode("utf-8", "replace").strip()
+    if err:
+        detail += "，stderr：%s" % _short(err, limit)
+    return detail
+
+
 def _run_mac_auth_helper(exe, request):
     """把密钥与凭据路径交给客户端自带的 Node 运行时解密，令牌经 stdout 返回。
 
@@ -407,7 +417,8 @@ def _run_mac_auth_helper(exe, request):
     try:
         reply = json.loads(process.stdout.decode("utf-8"))
     except (ValueError, UnicodeError):
-        raise AuthFormatError("登录态助手返回了无法解析的结果") from None
+        raise AuthFormatError("登录态助手返回了无法解析的结果（%s）"
+                              % _helper_diagnosis(process)) from None
     if not isinstance(reply, dict) or reply.get("version") != 1:
         raise AuthFormatError("登录态助手返回格式不符")
     if reply.get("ok") is not True:
@@ -587,7 +598,8 @@ def _run_linux_auth_helper(exe, auth_file):
         try:
             reply = json.loads(process.stdout.decode("utf-8"))
         except (ValueError, UnicodeError):
-            raise AuthFormatError("登录态助手返回了无法解析的结果") from None
+            raise AuthFormatError("登录态助手返回了无法解析的结果（%s）"
+                                  % _helper_diagnosis(process)) from None
         if not isinstance(reply, dict) or reply.get("version") != 1:
             raise AuthFormatError("登录态助手返回格式不符")
         if reply.get("ok") is not True:
