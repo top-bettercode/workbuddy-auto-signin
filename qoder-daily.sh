@@ -6,7 +6,17 @@
 set -u
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
-PYTHON="$(ls -d "$HOME"/.pyenv/versions/*/bin/python3 2>/dev/null | sort -V | tail -1 || command -v python3)"
+# 不写死本机路径：可用 QODER_DAILY_PYTHON 指定，否则优先最新 pyenv，
+# 再退回 Homebrew / PATH；launchd 的 PATH 很小，最后用系统 Python 兜底。
+PYTHON="${QODER_DAILY_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  for cand in "$(ls -d "$HOME"/.pyenv/versions/*/bin/python3 2>/dev/null | sort -V | tail -1)" \
+              /opt/homebrew/bin/python3 /usr/local/bin/python3 \
+              "$(command -v python3 2>/dev/null)"; do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then PYTHON="$cand"; break; fi
+  done
+fi
+if [ -z "$PYTHON" ] && [ -x /usr/bin/python3 ]; then PYTHON=/usr/bin/python3; fi
 export PYTHONIOENCODING="utf-8"
 
 TODAY="$(date +%F)"

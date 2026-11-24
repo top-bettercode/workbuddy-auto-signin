@@ -8,7 +8,17 @@
 set -u
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
-PYTHON="$(ls -d "$HOME"/.pyenv/versions/*/bin/python3 2>/dev/null | sort -V | tail -1 || command -v python3)"
+# 不写死本机路径：可用 WORKBUDDY_DAILY_PYTHON 指定，否则优先最新 pyenv，
+# 再退回 Homebrew / PATH；launchd 的 PATH 很小，最后用系统 Python 兜底。
+PYTHON="${WORKBUDDY_DAILY_PYTHON:-}"
+if [ -z "$PYTHON" ]; then
+  for cand in "$(ls -d "$HOME"/.pyenv/versions/*/bin/python3 2>/dev/null | sort -V | tail -1)" \
+              /opt/homebrew/bin/python3 /usr/local/bin/python3 \
+              "$(command -v python3 2>/dev/null)"; do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then PYTHON="$cand"; break; fi
+  done
+fi
+if [ -z "$PYTHON" ] && [ -x /usr/bin/python3 ]; then PYTHON=/usr/bin/python3; fi
 # launchd 的 PATH 极小（/usr/bin:/bin:...），而 codebuddy 的 shebang 是
 # 「#!/usr/bin/env node」——不补 PATH 会在启动时报 env: node: No such file
 # or directory（退出码 127）。与 workbuddy-daily-linux.sh 一致：把最新 nvm
